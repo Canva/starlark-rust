@@ -101,6 +101,11 @@ impl<'v, V: ValueLike<'v>> RecordGen<V> {
         record_fields(self.get_record_type())
     }
 
+    /// The `RecordType` this instance was constructed from, as a `Value`.
+    pub fn record_type(&self) -> Value<'v> {
+        self.typ.to_value()
+    }
+
     /// Iterate over the elements in the record.
     pub fn iter<'a>(&'a self) -> impl ExactSizeIterator<Item = (&'v str, V)> + 'a
     where
