@@ -28,6 +28,8 @@ use starlark_syntax::syntax::ast::StmtP;
 use starlark_syntax::syntax::module::AstModuleFields;
 use starlark_syntax::syntax::top_level_stmts::top_level_stmts;
 
+use crate::analysis::types::EvalMessage;
+use crate::analysis::types::EvalSeverity;
 use crate::environment::names::MutableNames;
 use crate::eval::compiler::scope::BindingId;
 use crate::eval::compiler::scope::ModuleScopes;
@@ -180,4 +182,44 @@ pub(crate) fn find_unused_loads(
     }
 
     Ok(((*codemap).dupe(), unused))
+}
+
+/// Find unused `load()` statements and symbols, returned as lint-style
+/// diagnostics. Unlike `remove_unused_loads`, this does not rewrite the
+/// source: it's for embedders that want to surface these as warnings
+/// (e.g. in a linter or an LSP) rather than auto-fix them.
+pub fn find_unused_load_diagnostics(name: &str, program: &str) -> crate::Result<Vec<EvalMessage>> {
+    let (codemap, unused_loads) = find_unused_loads(name, program)?;
+    let mut messages = Vec::new();
+    for load in &unused_loads {
+        if load.all_unused() {
+            let file_span = codemap.file_span(load.load.span);
+            messages.push(EvalMessage {
+                path: file_span.filename().to_owned(),
+                span: Some(file_span.resolve_span()),
+                severity: EvalSeverity::Warning,
+                name: "unused-load".to_owned(),
+                description: format!(
+                    "`load(\"{}\", ...)` is unused and can be removed",
+                    load.load.node.module.node
+                ),
+                full_error_with_span: None,
+                original: Some(file_span.source_span().to_owned()),
+            });
+        } else {
+            for arg in &load.unused_args {
+                let file_span = codemap.file_span(arg.span_with_trailing_comma());
+                messages.push(EvalMessage {
+                    path: file_span.filename().to_owned(),
+                    span: Some(file_span.resolve_span()),
+                    severity: EvalSeverity::Warning,
+                    name: "unused-load".to_owned(),
+                    description: format!("loaded symbol `{}` is unused", arg.local.node.ident),
+                    full_error_with_span: None,
+                    original: Some(file_span.source_span().to_owned()),
+                });
+            }
+        }
+    }
+    Ok(messages)
 }

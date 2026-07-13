@@ -23,6 +23,7 @@ pub use lint_message::LintMessage;
 pub use types::EvalMessage;
 pub use types::EvalSeverity;
 pub use types::Lint;
+pub use unused_loads::find::find_unused_load_diagnostics;
 pub use unused_loads::remove::remove_unused_loads;
 
 use crate::analysis::types::LintT;
