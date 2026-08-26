@@ -103,8 +103,10 @@ use starlark_syntax::syntax::ast::LoadArgP;
 use starlark_syntax::syntax::module::AstModuleFields;
 use tower_lsp_server::UriExt as _;
 
+use crate::completion::DotContext;
 use crate::completion::StringCompletionResult;
 use crate::completion::StringCompletionType;
+use crate::completion::scan_dot_context;
 use crate::definition::Definition;
 use crate::definition::DottedDefinition;
 use crate::definition::IdentifierDefinition;
@@ -408,6 +410,10 @@ pub(crate) struct Backend<T: LspContext> {
     /// The `AstModule` from the last time that a file was opened / changed and parsed successfully.
     /// Entries are evicted when the file is closed.
     pub(crate) last_valid_parse: RwLock<HashMap<LspUri, Arc<LspModule>>>,
+    /// The most recent text received for each open file, whether or not it
+    /// parsed. Member completion works on text: the dot state (`x = yaml.`)
+    /// is a parse error, so `last_valid_parse` alone cannot see it.
+    pub(crate) latest_text: RwLock<HashMap<LspUri, String>>,
 }
 
 /// The logic implementations of stuff
@@ -423,7 +429,12 @@ impl<T: LspContext> Backend<T> {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             definition_provider,
-            completion_provider: Some(CompletionOptions::default()),
+            completion_provider: Some(CompletionOptions {
+                // `.` starts member completion (e.g. `yaml.`); without it,
+                // editors only request completions on identifier characters.
+                trigger_characters: Some(vec![".".to_owned()]),
+                ..CompletionOptions::default()
+            }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             ..ServerCapabilities::default()
         }
@@ -450,7 +461,11 @@ impl<T: LspContext> Backend<T> {
     }
 
     fn validate(&self, uri: Uri, version: Option<i64>, text: String) -> Result<(), LspOpError> {
-        let lsp_uri = uri.clone().try_into()?;
+        let lsp_uri: LspUri = uri.clone().try_into()?;
+        self.latest_text
+            .write()
+            .unwrap()
+            .insert(lsp_uri.clone(), text.clone());
         let eval_result = self.context.parse_file_with_contents(&lsp_uri, text);
         if let Some(ast) = eval_result.ast {
             let module = Arc::new(LspModule::new(ast));
@@ -481,8 +496,10 @@ impl<T: LspContext> Backend<T> {
 
     fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<(), LspOpError> {
         {
+            let lsp_uri: LspUri = params.text_document.uri.clone().try_into()?;
             let mut last_valid_parse = self.last_valid_parse.write().unwrap();
-            last_valid_parse.remove(&params.text_document.uri.clone().try_into()?);
+            last_valid_parse.remove(&lsp_uri);
+            self.latest_text.write().unwrap().remove(&lsp_uri);
         }
         self.publish_diagnostics(params.text_document.uri, Vec::new(), None);
         Ok(())
@@ -765,75 +782,103 @@ impl<T: LspContext> Backend<T> {
 
         let symbols: Option<Vec<_>> = match self.get_ast(&uri) {
             Some(document) => {
-                // Figure out what kind of position we are in, to determine the best type of
-                // autocomplete.
-                let autocomplete_type = document.ast.get_auto_complete_type(line, character);
                 let workspace_root =
                     Self::get_workspace_root(initialize_params.workspace_folders.as_ref(), &uri);
 
-                match &autocomplete_type {
-                    None | Some(AutocompleteType::None) => None,
-                    Some(AutocompleteType::Default) => Some(
-                        self.default_completion_options(
-                            &uri,
-                            &document,
-                            line,
-                            character,
-                            workspace_root.as_deref(),
-                        )
-                        .collect(),
-                    ),
-                    Some(AutocompleteType::LoadPath {
-                        current_value,
-                        current_span,
-                    })
-                    | Some(AutocompleteType::String {
-                        current_value,
-                        current_span,
-                    }) => Some(self.string_completion_options(
+                // Member (dot) completion is detected from the latest text,
+                // not the last valid parse: `x = yaml.` does not parse, so the
+                // AST alone cannot see the dot.
+                let line_text = self
+                    .latest_text
+                    .read()
+                    .unwrap()
+                    .get(&uri)
+                    .and_then(|text| text.lines().nth(line as usize).map(str::to_owned));
+                let dot_context = line_text.and_then(|text| scan_dot_context(&text, character));
+                match dot_context {
+                    Some(DotContext::Member { root }) => Some(self.member_completion_options(
+                        &document,
                         &uri,
-                        if matches!(&autocomplete_type, Some(AutocompleteType::LoadPath { .. })) {
-                            StringCompletionType::LoadPath
-                        } else {
-                            StringCompletionType::String
-                        },
-                        current_value,
-                        *current_span,
-                        workspace_root.as_deref(),
-                    )?),
-                    Some(AutocompleteType::LoadSymbol {
-                        path,
-                        current_span,
-                        previously_loaded,
-                    }) => Some(self.exported_symbol_options(
-                        path,
-                        *current_span,
-                        previously_loaded,
-                        &uri,
+                        &root,
                         workspace_root.as_deref(),
                     )),
-                    Some(AutocompleteType::Parameter {
-                        function_name_span,
-                        previously_used_named_parameters,
-                        ..
-                    }) => Some(
-                        self.parameter_name_options(
-                            function_name_span,
-                            &document,
-                            &uri,
-                            previously_used_named_parameters,
-                            workspace_root.as_deref(),
-                        )
-                        .chain(self.default_completion_options(
-                            &uri,
-                            &document,
-                            line,
-                            character,
-                            workspace_root.as_deref(),
-                        ))
-                        .collect(),
-                    ),
-                    Some(AutocompleteType::Type) => Some(Self::type_completion_options().collect()),
+                    Some(DotContext::Suppress) => Some(Vec::new()),
+                    None => {
+                        // Figure out what kind of position we are in, to determine the best type of
+                        // autocomplete.
+                        let autocomplete_type =
+                            document.ast.get_auto_complete_type(line, character);
+
+                        match &autocomplete_type {
+                            None | Some(AutocompleteType::None) => None,
+                            Some(AutocompleteType::Default) => Some(
+                                self.default_completion_options(
+                                    &uri,
+                                    &document,
+                                    line,
+                                    character,
+                                    workspace_root.as_deref(),
+                                )
+                                .collect(),
+                            ),
+                            Some(AutocompleteType::LoadPath {
+                                current_value,
+                                current_span,
+                            })
+                            | Some(AutocompleteType::String {
+                                current_value,
+                                current_span,
+                            }) => Some(self.string_completion_options(
+                                &uri,
+                                if matches!(
+                                    &autocomplete_type,
+                                    Some(AutocompleteType::LoadPath { .. })
+                                ) {
+                                    StringCompletionType::LoadPath
+                                } else {
+                                    StringCompletionType::String
+                                },
+                                current_value,
+                                *current_span,
+                                workspace_root.as_deref(),
+                            )?),
+                            Some(AutocompleteType::LoadSymbol {
+                                path,
+                                current_span,
+                                previously_loaded,
+                            }) => Some(self.exported_symbol_options(
+                                path,
+                                *current_span,
+                                previously_loaded,
+                                &uri,
+                                workspace_root.as_deref(),
+                            )),
+                            Some(AutocompleteType::Parameter {
+                                function_name_span,
+                                previously_used_named_parameters,
+                                ..
+                            }) => Some(
+                                self.parameter_name_options(
+                                    function_name_span,
+                                    &document,
+                                    &uri,
+                                    previously_used_named_parameters,
+                                    workspace_root.as_deref(),
+                                )
+                                .chain(self.default_completion_options(
+                                    &uri,
+                                    &document,
+                                    line,
+                                    character,
+                                    workspace_root.as_deref(),
+                                ))
+                                .collect(),
+                            ),
+                            Some(AutocompleteType::Type) => {
+                                Some(Self::type_completion_options().collect())
+                            }
+                        }
+                    }
                 }
             }
             None => None,
@@ -1340,6 +1385,7 @@ pub fn server_with_connection<T: LspContext>(
         connection,
         context,
         last_valid_parse: RwLock::default(),
+        latest_text: RwLock::default(),
     }
     .main_loop(initialization_params)?;
 
