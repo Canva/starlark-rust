@@ -1198,7 +1198,33 @@ impl<T: LspContext> Backend<T> {
                         range: Some(source.into()),
                     })
             }
-            IdentifierDefinition::LoadPath { .. } | IdentifierDefinition::NotFound => None,
+            IdentifierDefinition::LoadPath { source, path } => {
+                // List what the module exports — the team's requested behavior for
+                // hovering a load path (bazel labels and @builtin// refs are opaque).
+                match self.resolve_load_path(&path, document_uri, workspace_root) {
+                    Ok(load_uri) => self.get_ast_or_load_from_disk(&load_uri)?.map(|ast| {
+                        let list = ast
+                            .get_exported_symbols()
+                            .iter()
+                            .map(|symbol| match &symbol.kind {
+                                crate::exported::SymbolKind::Function { .. } => {
+                                    format!("- `{}()`", symbol.name)
+                                }
+                                crate::exported::SymbolKind::Any => format!("- `{}`", symbol.name),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Hover {
+                            contents: HoverContents::Array(vec![MarkedString::String(format!(
+                                "Symbols in `{path}`:\n\n{list}"
+                            ))]),
+                            range: Some(source.into()),
+                        }
+                    }),
+                    Err(_) => None,
+                }
+            }
+            IdentifierDefinition::NotFound => None,
         })
     }
 
@@ -1426,13 +1452,18 @@ mod tests {
     use lsp_server::RequestId;
     use lsp_types::GotoDefinitionParams;
     use lsp_types::GotoDefinitionResponse;
+    use lsp_types::Hover;
+    use lsp_types::HoverContents;
+    use lsp_types::HoverParams;
     use lsp_types::LocationLink;
+    use lsp_types::MarkedString;
     use lsp_types::Position;
     use lsp_types::Range;
     use lsp_types::TextDocumentIdentifier;
     use lsp_types::TextDocumentPositionParams;
     use lsp_types::Uri;
     use lsp_types::request::GotoDefinition;
+    use lsp_types::request::HoverRequest;
     use starlark::codemap::ResolvedSpan;
     use starlark::wasm::is_wasm;
     use textwrap::dedent;
@@ -1460,6 +1491,38 @@ mod tests {
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         })
+    }
+
+    fn hover_response(
+        server: &mut TestServer,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Hover> {
+        let req = server.new_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+        });
+        let request_id = server.send_request(req)?;
+        server.get_response::<Hover>(request_id)
+    }
+
+    /// All hover content flattened to one string for assertions.
+    fn hover_text(hover: &Hover) -> String {
+        match &hover.contents {
+            HoverContents::Array(items) => items
+                .iter()
+                .map(|m| match m {
+                    MarkedString::String(s) => s.clone(),
+                    MarkedString::LanguageString(ls) => ls.value.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
     }
 
     fn goto_definition_response_location(
@@ -2557,6 +2620,36 @@ mod tests {
                 case.2
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hover_on_load_path_lists_exported_symbols() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let defs_uri = temp_file_uri("defs.star");
+        let uri = temp_file_uri("file.star");
+
+        let mut server = TestServer::new()?;
+        server.set_file_contents(
+            &defs_uri,
+            "Config = record()\ndef helper():\n    pass\n_private = 1\n".to_owned(),
+        )?;
+        let contents = format!(
+            "load(\"{}\", \"Config\", \"helper\")\nc = Config\nh = helper\n",
+            uri_to_load_string(&defs_uri)
+        );
+        server.open_file(uri.clone(), contents)?;
+
+        // Hover inside the load path string (line 0, col 8 is within the quoted path).
+        let text = hover_text(&hover_response(&mut server, &uri, 0, 8)?);
+        assert!(text.contains("`Config`"), "lists values, got: {text}");
+        assert!(text.contains("`helper()`"), "functions get (), got: {text}");
+        assert!(
+            !text.contains("_private"),
+            "private symbols excluded, got: {text}"
+        );
         Ok(())
     }
 }
