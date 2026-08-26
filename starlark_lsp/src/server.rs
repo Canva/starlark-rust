@@ -1064,20 +1064,19 @@ impl<T: LspContext> Backend<T> {
                             &document,
                             &uri,
                             workspace_root.as_deref(),
+                            None,
                         )?,
                     Definition::Dotted(DottedDefinition {
                         root_definition_location,
+                        segments,
                         ..
-                    }) => {
-                        // Not something we really support yet, so just provide hover information for
-                        // the root definition.
-                        self.get_hover_for_identifier_definition(
-                            root_definition_location,
-                            &document,
-                            &uri,
-                            workspace_root.as_deref(),
-                        )?
-                    }
+                    }) => self.get_hover_for_identifier_definition(
+                        root_definition_location,
+                        &document,
+                        &uri,
+                        workspace_root.as_deref(),
+                        segments.get(1).map(String::as_str),
+                    )?,
                 }
                 .unwrap_or(not_found)
             }
@@ -1091,6 +1090,7 @@ impl<T: LspContext> Backend<T> {
         document: &LspModule,
         document_uri: &LspUri,
         workspace_root: Option<&Path>,
+        member: Option<&str>,
     ) -> Result<Option<Hover>, LspOpError> {
         Ok(match identifier_definition {
             IdentifierDefinition::Location {
@@ -1132,10 +1132,25 @@ impl<T: LspContext> Backend<T> {
             IdentifierDefinition::LoadedLocation {
                 path, name, source, ..
             } => {
-                // Symbol loaded from another file. Find the file and get the definition
-                // from there, hopefully including the docs.
+                // Symbol loaded from another file. Find the file and get the
+                // definition from there, hopefully including the docs.
                 let load_uri = self.resolve_load_path(&path, document_uri, workspace_root)?;
                 self.get_ast_or_load_from_disk(&load_uri)?.and_then(|ast| {
+                    // `root.member` access: prefer the member's own docs when it
+                    // resolves as an exported symbol (builtin stubs export their
+                    // member defs); otherwise fall back to the root as before.
+                    if let Some(member) = member {
+                        if let Some(member_symbol) = ast.find_exported_symbol(member) {
+                            if let Some(docs) = member_symbol.docs {
+                                return Some(Hover {
+                                    contents: HoverContents::Array(vec![MarkedString::String(
+                                        render_doc_item_no_link(&member_symbol.name, &docs),
+                                    )]),
+                                    range: Some(source.into()),
+                                });
+                            }
+                        }
+                    }
                     ast.find_exported_symbol(&name).and_then(|symbol| {
                         symbol.docs.map(|docs| Hover {
                             contents: HoverContents::Array(vec![MarkedString::String(
@@ -2650,6 +2665,33 @@ mod tests {
             !text.contains("_private"),
             "private symbols excluded, got: {text}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn hover_on_dotted_member_of_loaded_struct_shows_member_docs() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let defs_uri = temp_file_uri("defs.star");
+        let uri = temp_file_uri("file.star");
+
+        let mut server = TestServer::new()?;
+        server.set_file_contents(
+            &defs_uri,
+            "def dumps():\n    \"\"\"Dumps docs.\"\"\"\n    pass\n\nyaml = struct(\n    dumps = dumps,\n)\n"
+                .to_owned(),
+        )?;
+        let contents = format!(
+            "load(\"{}\", \"yaml\")\ny = yaml.dumps()\n",
+            uri_to_load_string(&defs_uri)
+        );
+        server.open_file(uri.clone(), contents)?;
+
+        // Hover `dumps` in `y = yaml.dumps()` (line 1, col 10).
+        let text = hover_text(&hover_response(&mut server, &uri, 1, 10)?);
+        assert!(text.contains("Dumps docs."), "member docs, got: {text}");
+        assert!(!text.contains("pass"), "docs rendering, not source, got: {text}");
         Ok(())
     }
 }
