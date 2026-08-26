@@ -34,13 +34,18 @@ use starlark::docs::DocMember;
 use starlark::docs::markdown::render_doc_item_no_link;
 use starlark::docs::markdown::render_doc_param;
 use starlark_syntax::codemap::ResolvedPos;
+use starlark_syntax::syntax::ast::ArgumentP;
+use starlark_syntax::syntax::ast::AssignTargetP;
+use starlark_syntax::syntax::ast::ExprP;
 use starlark_syntax::syntax::ast::StmtP;
 use starlark_syntax::syntax::module::AstModuleFields;
+use starlark_syntax::syntax::top_level_stmts::top_level_stmts;
 
 use crate::definition::Definition;
 use crate::definition::DottedDefinition;
 use crate::definition::IdentifierDefinition;
 use crate::definition::LspModule;
+use crate::docs::get_doc_item_for_def;
 use crate::exported::SymbolKind as ExportedSymbolKind;
 use crate::server::Backend;
 use crate::server::LspContext;
@@ -69,6 +74,181 @@ pub struct StringCompletionResult {
     pub insert_text_offset: usize,
     /// The kind of result, e.g. a file vs a folder.
     pub kind: CompletionItemKind,
+}
+
+/// The result of scanning a line of source text leftwards from the cursor for a
+/// member-access (dot) completion context.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DotContext {
+    /// Cursor is after `root.` (possibly mid-word, e.g. `root.par`): offer the
+    /// members of `root`.
+    Member { root: String },
+    /// A dot context that is deliberately not completed (chained access like
+    /// `a.b.`, or inside a comment). Distinct from `None` so the caller
+    /// suppresses the default completions instead of falling back to them.
+    Suppress,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Scan `line` leftwards from the cursor at byte column `character` and
+/// classify the completion context. `None` means "not a dot context" and the
+/// caller falls through to the regular completion flow.
+///
+/// Works on raw text rather than the AST because the dot state (`x = yaml.`)
+/// is a parse error — the AST is one keystroke stale, but the text is not.
+/// Scanning bytes is safe: Starlark identifiers are ASCII, and UTF-8
+/// continuation bytes never match `is_ident_byte`.
+pub(crate) fn scan_dot_context(line: &str, character: u32) -> Option<DotContext> {
+    let bytes = line.as_bytes();
+    let cursor = (character as usize).min(bytes.len());
+
+    // Skip back over the partially-typed member word (`re` of `helpers.re`).
+    let mut i = cursor;
+    while i > 0 && is_ident_byte(bytes[i - 1]) {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] != b'.' {
+        return None;
+    }
+    let dot = i - 1;
+
+    // Scan back over the root identifier (`helpers` of `helpers.`).
+    let mut root_start = dot;
+    while root_start > 0 && is_ident_byte(bytes[root_start - 1]) {
+        root_start -= 1;
+    }
+    let root = &line[root_start..dot];
+    // Empty (`f().`, `"s".`) or number-like (`1.` is a float literal) roots
+    // are not member access on an identifier.
+    if root.is_empty() || root.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+
+    if root_start > 0 && bytes[root_start - 1] == b'.' {
+        return Some(DotContext::Suppress);
+    }
+
+    // A `#` earlier on the line outside string quotes means the cursor is in a
+    // comment. Line-local heuristic; multi-line strings are accepted noise.
+    let mut in_single = false;
+    let mut in_double = false;
+    for &b in &bytes[..root_start] {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double => return Some(DotContext::Suppress),
+            _ => {}
+        }
+    }
+
+    Some(DotContext::Member {
+        root: root.to_owned(),
+    })
+}
+
+/// Kind and docs for the top-level symbol `name` in `module`.
+///
+/// Unlike `exported_symbols()`, underscore-prefixed names are included: struct
+/// fields routinely reference private helpers (`render = _render`).
+fn top_level_symbol_kind_and_docs(
+    module: &LspModule,
+    name: &str,
+) -> Option<(ExportedSymbolKind, Option<DocItem>)> {
+    for stmt in top_level_stmts(module.ast.statement()) {
+        match &stmt.node {
+            StmtP::Def(def) if def.name.ident == name => {
+                let kind = ExportedSymbolKind::Function {
+                    argument_names: def
+                        .params
+                        .iter()
+                        .filter_map(|param| param.split().0.map(|n| n.to_string()))
+                        .collect(),
+                };
+                let docs = get_doc_item_for_def(def, module.ast.codemap())
+                    .map(|f| DocItem::Member(DocMember::Function(f)));
+                return Some((kind, docs));
+            }
+            StmtP::Assign(assign) => {
+                let mut kind = None;
+                assign.lhs.visit_lvalue(|ident| {
+                    if ident.ident == name {
+                        kind = Some(ExportedSymbolKind::from_expr(&assign.rhs));
+                    }
+                });
+                if let Some(kind) = kind {
+                    return Some((kind, None));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Completion items for the fields of a `root = struct(field = value, ...)`
+/// top-level assignment in `module`, in declaration order.
+///
+/// The completion analogue of `LspModule::find_exported_symbol_and_member`:
+/// where a field's value is an identifier naming a top-level symbol (the
+/// `render = _render` idiom used by builtin stubs and user modules alike), the
+/// symbol's kind and docs are attached to the item.
+pub(crate) fn struct_field_completion_items(module: &LspModule, root: &str) -> Vec<CompletionItem> {
+    for stmt in top_level_stmts(module.ast.statement()) {
+        let StmtP::Assign(assign) = &stmt.node else {
+            continue;
+        };
+        let AssignTargetP::Identifier(lhs) = &assign.lhs.node else {
+            continue;
+        };
+        if lhs.ident != root {
+            continue;
+        }
+        let ExprP::Call(function, args) = &assign.rhs.node else {
+            continue;
+        };
+        let ExprP::Identifier(function_name) = &function.node else {
+            continue;
+        };
+        if function_name.node.ident != "struct" {
+            continue;
+        }
+
+        return args
+            .args
+            .iter()
+            .filter_map(|arg| {
+                let ArgumentP::Named(field, value) = &arg.node else {
+                    return None;
+                };
+                let referenced = match &value.node {
+                    ExprP::Identifier(id) => top_level_symbol_kind_and_docs(module, &id.node.ident),
+                    _ => None,
+                };
+                let (kind, documentation) = match referenced {
+                    Some((kind, docs)) => {
+                        let documentation = docs.map(|docs| {
+                            Documentation::MarkupContent(MarkupContent {
+                                kind: MarkupKind::Markdown,
+                                value: render_doc_item_no_link(&field.node, &docs),
+                            })
+                        });
+                        (CompletionItemKind::from(kind), documentation)
+                    }
+                    None => (CompletionItemKind::FIELD, None),
+                };
+                Some(CompletionItem {
+                    label: field.node.clone(),
+                    kind: Some(kind),
+                    documentation,
+                    ..Default::default()
+                })
+            })
+            .collect();
+    }
+    Vec::new()
 }
 
 impl<T: LspContext> Backend<T> {
@@ -369,5 +549,141 @@ impl<T: LspContext> Backend<T> {
                 kind: Some(CompletionItemKind::TYPE_PARAMETER),
                 ..Default::default()
             })
+    }
+
+    /// Completion items for `root.` where `root` is a symbol loaded by
+    /// `document`. Empty when the root is not a loaded symbol or the loaded
+    /// module has no matching `name = struct(...)` — deliberately not falling
+    /// back to default completions, which are noise after a dot.
+    pub(crate) fn member_completion_options(
+        &self,
+        document: &LspModule,
+        document_uri: &LspUri,
+        root: &str,
+        workspace_root: Option<&Path>,
+    ) -> Vec<CompletionItem> {
+        // Match load statements by name rather than resolving the root by
+        // position: completion positions come from the latest text while
+        // `document` is the last valid parse, so positions can be stale but
+        // names cannot. `load("m", h = "helpers")` binds local `h` to remote
+        // `helpers`; the struct lookup needs the remote name.
+        let Some((load_path, remote_name)) = top_level_stmts(document.ast.statement())
+            .into_iter()
+            .find_map(|stmt| {
+                let StmtP::Load(load) = &stmt.node else {
+                    return None;
+                };
+                load.args.iter().find_map(|arg| {
+                    (arg.local.ident == root)
+                        .then(|| (load.module.node.clone(), arg.their.node.clone()))
+                })
+            })
+        else {
+            return Vec::new();
+        };
+        let Ok(load_uri) = self.resolve_load_path(&load_path, document_uri, workspace_root) else {
+            return Vec::new();
+        };
+        let Ok(Some(loaded)) = self.get_ast_or_load_from_disk(&load_uri) else {
+            return Vec::new();
+        };
+        struct_field_completion_items(&loaded, &remote_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(root: &str) -> Option<DotContext> {
+        Some(DotContext::Member {
+            root: root.to_owned(),
+        })
+    }
+
+    #[test]
+    fn test_scan_dot_context_member() {
+        assert_eq!(scan_dot_context("x = yaml.", 9), member("yaml"));
+        assert_eq!(scan_dot_context("x = yaml.du", 11), member("yaml"));
+        assert_eq!(scan_dot_context("yaml.", 5), member("yaml"));
+        assert_eq!(scan_dot_context("f(yaml.", 7), member("yaml"));
+        // Cursor mid-word: everything right of the cursor is ignored.
+        assert_eq!(scan_dot_context("x = yaml.dump", 10), member("yaml"));
+    }
+
+    #[test]
+    fn test_scan_dot_context_none() {
+        assert_eq!(scan_dot_context("x = yaml", 8), None);
+        assert_eq!(scan_dot_context("", 0), None);
+        assert_eq!(scan_dot_context("x = ", 4), None);
+        // Not an identifier root.
+        assert_eq!(scan_dot_context("f().", 4), None);
+        assert_eq!(scan_dot_context("\"s\".", 4), None);
+        // Float literal, not member access.
+        assert_eq!(scan_dot_context("x = 1.", 6), None);
+        // Cursor beyond line end is clamped.
+        assert_eq!(scan_dot_context("x", 5), None);
+    }
+
+    #[test]
+    fn test_scan_dot_context_suppressed() {
+        // Chained access: recognised, deliberately not completed.
+        assert_eq!(scan_dot_context("a.b.", 4), Some(DotContext::Suppress));
+        // Comments.
+        assert_eq!(scan_dot_context("# yaml.", 7), Some(DotContext::Suppress));
+        assert_eq!(
+            scan_dot_context("x = 1  # yaml.", 14),
+            Some(DotContext::Suppress)
+        );
+    }
+
+    #[test]
+    fn test_scan_dot_context_hash_inside_string_is_not_a_comment() {
+        assert_eq!(scan_dot_context("x = \"#\" + yaml.", 15), member("yaml"));
+    }
+
+    use starlark::syntax::AstModule;
+    use starlark::syntax::Dialect;
+
+    use crate::definition::LspModule;
+
+    fn lsp_module(source: &str) -> LspModule {
+        LspModule::new(
+            AstModule::parse("t.star", source.to_owned(), &Dialect::AllOptionsInternal).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_struct_field_completion_items() {
+        let module = lsp_module(
+            r#"
+def _render(config):
+    """Render the config."""
+    pass
+
+helpers = struct(
+    render = _render,
+    version = "1.0",
+)
+"#,
+        );
+        let items = struct_field_completion_items(&module, "helpers");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].label, "render");
+        assert_eq!(items[0].kind, Some(CompletionItemKind::FUNCTION));
+        assert!(
+            items[0].documentation.is_some(),
+            "docstring of _render should be attached"
+        );
+        assert_eq!(items[1].label, "version");
+        assert_eq!(items[1].kind, Some(CompletionItemKind::FIELD));
+
+        assert!(struct_field_completion_items(&module, "nope").is_empty());
+    }
+
+    #[test]
+    fn test_struct_field_completion_items_non_struct_assign() {
+        let module = lsp_module("helpers = [1, 2]\n");
+        assert!(struct_field_completion_items(&module, "helpers").is_empty());
     }
 }

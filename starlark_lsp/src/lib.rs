@@ -23,6 +23,8 @@
 #[allow(clippy::type_complexity)]
 mod bind;
 pub mod completion;
+#[cfg(test)]
+mod completion_tests;
 mod definition;
 pub(crate) mod docs;
 pub mod error;
