@@ -150,3 +150,48 @@ fn test_member_completion_respects_load_rename() {
         vec!["render".to_owned(), "validate".to_owned()]
     );
 }
+
+/// Regression test: `assert` lexes as an ordinary identifier in this dialect
+/// (see lexer.rs), because builtin stubs generate `assert = struct(...)` for
+/// `load("@builtin//assert", "assert")`. The stub must both parse and offer
+/// member completions.
+#[test]
+fn test_member_completion_for_assert_named_struct() {
+    let mut server = TestServer::new().unwrap();
+    let stub_uri = Uri::from_str("file:///dir/assert_stub.star").unwrap();
+    let test_uri = Uri::from_str("file:///dir/test.star").unwrap();
+    server
+        .set_file_contents(
+            &stub_uri,
+            r#"
+def eq(a, b):
+    pass
+
+def fails(f, msg):
+    pass
+
+assert = struct(
+    eq = eq,
+    fails = fails,
+)
+"#
+            .to_owned(),
+        )
+        .unwrap();
+    server
+        .open_file(
+            test_uri.clone(),
+            "load(\"assert_stub.star\", \"assert\")\nx = assert\n".to_owned(),
+        )
+        .unwrap();
+    server
+        .change_file(
+            test_uri.clone(),
+            "load(\"assert_stub.star\", \"assert\")\nx = assert.\n".to_owned(),
+        )
+        .unwrap();
+    assert_eq!(
+        completion_labels(&mut server, &test_uri, 1, 11),
+        vec!["eq".to_owned(), "fails".to_owned()]
+    );
+}
