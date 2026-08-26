@@ -1263,9 +1263,12 @@ pub enum Token {
 
     Bytes(Vec<u8>), // A bytes literal
 
+    // `assert` is deliberately absent from this list (the Starlark spec
+    // reserves it for future use): Canva's dialect exposes an `assert`
+    // builtin namespace (`load("@builtin//assert", "assert")`), so it must
+    // lex as an ordinary identifier.
     #[regex(
         "as|\
-        assert|\
         async|\
         await|\
         class|\
@@ -1597,6 +1600,20 @@ mod tests {
         assert_eq!(lex_exactly_one_identifier("foo bar"), None);
         assert_eq!(lex_exactly_one_identifier("not"), None);
         assert_eq!(lex_exactly_one_identifier("123"), None);
+    }
+
+    /// `assert` is not reserved in this dialect: it names a builtin namespace
+    /// (`load("@builtin//assert", "assert")`), so both the loaded binding and
+    /// generated stubs like `assert = struct(...)` must lex.
+    #[test]
+    fn test_assert_is_an_identifier() {
+        assert_eq!(
+            lex_exactly_one_identifier("assert").as_deref(),
+            Some("assert")
+        );
+        // Neighbouring spec-reserved words stay reserved.
+        assert_eq!(lex_exactly_one_identifier("class"), None);
+        assert_eq!(lex_exactly_one_identifier("import"), None);
     }
 
     #[test]

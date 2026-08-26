@@ -636,6 +636,16 @@ fn test_error_reserved_keyword() {
     );
 }
 
+/// `assert` is deliberately not reserved in this dialect: it names a builtin
+/// namespace (`load("@builtin//assert", "assert")`), so the loaded binding,
+/// member access, and generated stubs like `assert = struct(...)` must parse.
+#[test]
+fn test_assert_is_not_reserved() {
+    parse("assert = struct(eq = eq)");
+    parse("load(\"@builtin//assert\", \"assert\")\nassert.eq(1, 1)");
+    parse("assert.fails(f, \"msg\")");
+}
+
 #[test]
 fn test_error_bad_comprehension() {
     parse_fails(

@@ -103,8 +103,10 @@ use starlark_syntax::syntax::ast::LoadArgP;
 use starlark_syntax::syntax::module::AstModuleFields;
 use tower_lsp_server::UriExt as _;
 
+use crate::completion::DotContext;
 use crate::completion::StringCompletionResult;
 use crate::completion::StringCompletionType;
+use crate::completion::scan_dot_context;
 use crate::definition::Definition;
 use crate::definition::DottedDefinition;
 use crate::definition::IdentifierDefinition;
@@ -408,6 +410,10 @@ pub(crate) struct Backend<T: LspContext> {
     /// The `AstModule` from the last time that a file was opened / changed and parsed successfully.
     /// Entries are evicted when the file is closed.
     pub(crate) last_valid_parse: RwLock<HashMap<LspUri, Arc<LspModule>>>,
+    /// The most recent text received for each open file, whether or not it
+    /// parsed. Member completion works on text: the dot state (`x = yaml.`)
+    /// is a parse error, so `last_valid_parse` alone cannot see it.
+    pub(crate) latest_text: RwLock<HashMap<LspUri, String>>,
 }
 
 /// The logic implementations of stuff
@@ -423,7 +429,12 @@ impl<T: LspContext> Backend<T> {
         ServerCapabilities {
             text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
             definition_provider,
-            completion_provider: Some(CompletionOptions::default()),
+            completion_provider: Some(CompletionOptions {
+                // `.` starts member completion (e.g. `yaml.`); without it,
+                // editors only request completions on identifier characters.
+                trigger_characters: Some(vec![".".to_owned()]),
+                ..CompletionOptions::default()
+            }),
             hover_provider: Some(HoverProviderCapability::Simple(true)),
             ..ServerCapabilities::default()
         }
@@ -450,7 +461,11 @@ impl<T: LspContext> Backend<T> {
     }
 
     fn validate(&self, uri: Uri, version: Option<i64>, text: String) -> Result<(), LspOpError> {
-        let lsp_uri = uri.clone().try_into()?;
+        let lsp_uri: LspUri = uri.clone().try_into()?;
+        self.latest_text
+            .write()
+            .unwrap()
+            .insert(lsp_uri.clone(), text.clone());
         let eval_result = self.context.parse_file_with_contents(&lsp_uri, text);
         if let Some(ast) = eval_result.ast {
             let module = Arc::new(LspModule::new(ast));
@@ -481,8 +496,10 @@ impl<T: LspContext> Backend<T> {
 
     fn did_close(&self, params: DidCloseTextDocumentParams) -> Result<(), LspOpError> {
         {
+            let lsp_uri: LspUri = params.text_document.uri.clone().try_into()?;
             let mut last_valid_parse = self.last_valid_parse.write().unwrap();
-            last_valid_parse.remove(&params.text_document.uri.clone().try_into()?);
+            last_valid_parse.remove(&lsp_uri);
+            self.latest_text.write().unwrap().remove(&lsp_uri);
         }
         self.publish_diagnostics(params.text_document.uri, Vec::new(), None);
         Ok(())
@@ -765,75 +782,103 @@ impl<T: LspContext> Backend<T> {
 
         let symbols: Option<Vec<_>> = match self.get_ast(&uri) {
             Some(document) => {
-                // Figure out what kind of position we are in, to determine the best type of
-                // autocomplete.
-                let autocomplete_type = document.ast.get_auto_complete_type(line, character);
                 let workspace_root =
                     Self::get_workspace_root(initialize_params.workspace_folders.as_ref(), &uri);
 
-                match &autocomplete_type {
-                    None | Some(AutocompleteType::None) => None,
-                    Some(AutocompleteType::Default) => Some(
-                        self.default_completion_options(
-                            &uri,
-                            &document,
-                            line,
-                            character,
-                            workspace_root.as_deref(),
-                        )
-                        .collect(),
-                    ),
-                    Some(AutocompleteType::LoadPath {
-                        current_value,
-                        current_span,
-                    })
-                    | Some(AutocompleteType::String {
-                        current_value,
-                        current_span,
-                    }) => Some(self.string_completion_options(
+                // Member (dot) completion is detected from the latest text,
+                // not the last valid parse: `x = yaml.` does not parse, so the
+                // AST alone cannot see the dot.
+                let line_text = self
+                    .latest_text
+                    .read()
+                    .unwrap()
+                    .get(&uri)
+                    .and_then(|text| text.lines().nth(line as usize).map(str::to_owned));
+                let dot_context = line_text.and_then(|text| scan_dot_context(&text, character));
+                match dot_context {
+                    Some(DotContext::Member { root }) => Some(self.member_completion_options(
+                        &document,
                         &uri,
-                        if matches!(&autocomplete_type, Some(AutocompleteType::LoadPath { .. })) {
-                            StringCompletionType::LoadPath
-                        } else {
-                            StringCompletionType::String
-                        },
-                        current_value,
-                        *current_span,
-                        workspace_root.as_deref(),
-                    )?),
-                    Some(AutocompleteType::LoadSymbol {
-                        path,
-                        current_span,
-                        previously_loaded,
-                    }) => Some(self.exported_symbol_options(
-                        path,
-                        *current_span,
-                        previously_loaded,
-                        &uri,
+                        &root,
                         workspace_root.as_deref(),
                     )),
-                    Some(AutocompleteType::Parameter {
-                        function_name_span,
-                        previously_used_named_parameters,
-                        ..
-                    }) => Some(
-                        self.parameter_name_options(
-                            function_name_span,
-                            &document,
-                            &uri,
-                            previously_used_named_parameters,
-                            workspace_root.as_deref(),
-                        )
-                        .chain(self.default_completion_options(
-                            &uri,
-                            &document,
-                            line,
-                            character,
-                            workspace_root.as_deref(),
-                        ))
-                        .collect(),
-                    ),
-                    Some(AutocompleteType::Type) => Some(Self::type_completion_options().collect()),
+                    Some(DotContext::Suppress) => Some(Vec::new()),
+                    None => {
+                        // Figure out what kind of position we are in, to determine the best type of
+                        // autocomplete.
+                        let autocomplete_type =
+                            document.ast.get_auto_complete_type(line, character);
+
+                        match &autocomplete_type {
+                            None | Some(AutocompleteType::None) => None,
+                            Some(AutocompleteType::Default) => Some(
+                                self.default_completion_options(
+                                    &uri,
+                                    &document,
+                                    line,
+                                    character,
+                                    workspace_root.as_deref(),
+                                )
+                                .collect(),
+                            ),
+                            Some(AutocompleteType::LoadPath {
+                                current_value,
+                                current_span,
+                            })
+                            | Some(AutocompleteType::String {
+                                current_value,
+                                current_span,
+                            }) => Some(self.string_completion_options(
+                                &uri,
+                                if matches!(
+                                    &autocomplete_type,
+                                    Some(AutocompleteType::LoadPath { .. })
+                                ) {
+                                    StringCompletionType::LoadPath
+                                } else {
+                                    StringCompletionType::String
+                                },
+                                current_value,
+                                *current_span,
+                                workspace_root.as_deref(),
+                            )?),
+                            Some(AutocompleteType::LoadSymbol {
+                                path,
+                                current_span,
+                                previously_loaded,
+                            }) => Some(self.exported_symbol_options(
+                                path,
+                                *current_span,
+                                previously_loaded,
+                                &uri,
+                                workspace_root.as_deref(),
+                            )),
+                            Some(AutocompleteType::Parameter {
+                                function_name_span,
+                                previously_used_named_parameters,
+                                ..
+                            }) => Some(
+                                self.parameter_name_options(
+                                    function_name_span,
+                                    &document,
+                                    &uri,
+                                    previously_used_named_parameters,
+                                    workspace_root.as_deref(),
+                                )
+                                .chain(self.default_completion_options(
+                                    &uri,
+                                    &document,
+                                    line,
+                                    character,
+                                    workspace_root.as_deref(),
+                                ))
+                                .collect(),
+                            ),
+                            Some(AutocompleteType::Type) => {
+                                Some(Self::type_completion_options().collect())
+                            }
+                        }
+                    }
                 }
             }
             None => None,
@@ -1064,20 +1109,19 @@ impl<T: LspContext> Backend<T> {
                             &document,
                             &uri,
                             workspace_root.as_deref(),
+                            None,
                         )?,
                     Definition::Dotted(DottedDefinition {
                         root_definition_location,
+                        segments,
                         ..
-                    }) => {
-                        // Not something we really support yet, so just provide hover information for
-                        // the root definition.
-                        self.get_hover_for_identifier_definition(
-                            root_definition_location,
-                            &document,
-                            &uri,
-                            workspace_root.as_deref(),
-                        )?
-                    }
+                    }) => self.get_hover_for_identifier_definition(
+                        root_definition_location,
+                        &document,
+                        &uri,
+                        workspace_root.as_deref(),
+                        segments.get(1).map(String::as_str),
+                    )?,
                 }
                 .unwrap_or(not_found)
             }
@@ -1091,6 +1135,7 @@ impl<T: LspContext> Backend<T> {
         document: &LspModule,
         document_uri: &LspUri,
         workspace_root: Option<&Path>,
+        member: Option<&str>,
     ) -> Result<Option<Hover>, LspOpError> {
         Ok(match identifier_definition {
             IdentifierDefinition::Location {
@@ -1132,10 +1177,25 @@ impl<T: LspContext> Backend<T> {
             IdentifierDefinition::LoadedLocation {
                 path, name, source, ..
             } => {
-                // Symbol loaded from another file. Find the file and get the definition
-                // from there, hopefully including the docs.
+                // Symbol loaded from another file. Find the file and get the
+                // definition from there, hopefully including the docs.
                 let load_uri = self.resolve_load_path(&path, document_uri, workspace_root)?;
                 self.get_ast_or_load_from_disk(&load_uri)?.and_then(|ast| {
+                    // `root.member` access: prefer the member's own docs when it
+                    // resolves as an exported symbol (builtin stubs export their
+                    // member defs); otherwise fall back to the root as before.
+                    if let Some(member) = member {
+                        if let Some(member_symbol) = ast.find_exported_symbol(member) {
+                            if let Some(docs) = member_symbol.docs {
+                                return Some(Hover {
+                                    contents: HoverContents::Array(vec![MarkedString::String(
+                                        render_doc_item_no_link(&member_symbol.name, &docs),
+                                    )]),
+                                    range: Some(source.into()),
+                                });
+                            }
+                        }
+                    }
                     ast.find_exported_symbol(&name).and_then(|symbol| {
                         symbol.docs.map(|docs| Hover {
                             contents: HoverContents::Array(vec![MarkedString::String(
@@ -1198,7 +1258,33 @@ impl<T: LspContext> Backend<T> {
                         range: Some(source.into()),
                     })
             }
-            IdentifierDefinition::LoadPath { .. } | IdentifierDefinition::NotFound => None,
+            IdentifierDefinition::LoadPath { source, path } => {
+                // List what the module exports — the team's requested behavior for
+                // hovering a load path (bazel labels and @builtin// refs are opaque).
+                match self.resolve_load_path(&path, document_uri, workspace_root) {
+                    Ok(load_uri) => self.get_ast_or_load_from_disk(&load_uri)?.map(|ast| {
+                        let list = ast
+                            .get_exported_symbols()
+                            .iter()
+                            .map(|symbol| match &symbol.kind {
+                                crate::exported::SymbolKind::Function { .. } => {
+                                    format!("- `{}()`", symbol.name)
+                                }
+                                crate::exported::SymbolKind::Any => format!("- `{}`", symbol.name),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Hover {
+                            contents: HoverContents::Array(vec![MarkedString::String(format!(
+                                "Symbols in `{path}`:\n\n{list}"
+                            ))]),
+                            range: Some(source.into()),
+                        }
+                    }),
+                    Err(_) => None,
+                }
+            }
+            IdentifierDefinition::NotFound => None,
         })
     }
 
@@ -1340,6 +1426,7 @@ pub fn server_with_connection<T: LspContext>(
         connection,
         context,
         last_valid_parse: RwLock::default(),
+        latest_text: RwLock::default(),
     }
     .main_loop(initialization_params)?;
 
@@ -1426,13 +1513,18 @@ mod tests {
     use lsp_server::RequestId;
     use lsp_types::GotoDefinitionParams;
     use lsp_types::GotoDefinitionResponse;
+    use lsp_types::Hover;
+    use lsp_types::HoverContents;
+    use lsp_types::HoverParams;
     use lsp_types::LocationLink;
+    use lsp_types::MarkedString;
     use lsp_types::Position;
     use lsp_types::Range;
     use lsp_types::TextDocumentIdentifier;
     use lsp_types::TextDocumentPositionParams;
     use lsp_types::Uri;
     use lsp_types::request::GotoDefinition;
+    use lsp_types::request::HoverRequest;
     use starlark::codemap::ResolvedSpan;
     use starlark::wasm::is_wasm;
     use textwrap::dedent;
@@ -1460,6 +1552,38 @@ mod tests {
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         })
+    }
+
+    fn hover_response(
+        server: &mut TestServer,
+        uri: &Uri,
+        line: u32,
+        character: u32,
+    ) -> anyhow::Result<Hover> {
+        let req = server.new_request::<HoverRequest>(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+        });
+        let request_id = server.send_request(req)?;
+        server.get_response::<Hover>(request_id)
+    }
+
+    /// All hover content flattened to one string for assertions.
+    fn hover_text(hover: &Hover) -> String {
+        match &hover.contents {
+            HoverContents::Array(items) => items
+                .iter()
+                .map(|m| match m {
+                    MarkedString::String(s) => s.clone(),
+                    MarkedString::LanguageString(ls) => ls.value.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
     }
 
     fn goto_definition_response_location(
@@ -2557,6 +2681,63 @@ mod tests {
                 case.2
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn hover_on_load_path_lists_exported_symbols() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let defs_uri = temp_file_uri("defs.star");
+        let uri = temp_file_uri("file.star");
+
+        let mut server = TestServer::new()?;
+        server.set_file_contents(
+            &defs_uri,
+            "Config = record()\ndef helper():\n    pass\n_private = 1\n".to_owned(),
+        )?;
+        let contents = format!(
+            "load(\"{}\", \"Config\", \"helper\")\nc = Config\nh = helper\n",
+            uri_to_load_string(&defs_uri)
+        );
+        server.open_file(uri.clone(), contents)?;
+
+        // Hover inside the load path string (line 0, col 8 is within the quoted path).
+        let text = hover_text(&hover_response(&mut server, &uri, 0, 8)?);
+        assert!(text.contains("`Config`"), "lists values, got: {text}");
+        assert!(text.contains("`helper()`"), "functions get (), got: {text}");
+        assert!(
+            !text.contains("_private"),
+            "private symbols excluded, got: {text}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hover_on_dotted_member_of_loaded_struct_shows_member_docs() -> anyhow::Result<()> {
+        if is_wasm() {
+            return Ok(());
+        }
+        let defs_uri = temp_file_uri("defs.star");
+        let uri = temp_file_uri("file.star");
+
+        let mut server = TestServer::new()?;
+        server.set_file_contents(
+            &defs_uri,
+            "def dumps():\n    \"\"\"Dumps docs.\"\"\"\n    pass\n\nyaml = struct(\n    dumps = dumps,\n)\n"
+                .to_owned(),
+        )?;
+        let contents = format!(
+            "load(\"{}\", \"yaml\")\ny = yaml.dumps()\n",
+            uri_to_load_string(&defs_uri)
+        );
+        server.open_file(uri.clone(), contents)?;
+
+        // Hover `dumps` in `y = yaml.dumps()` (line 1, col 10).
+        let text = hover_text(&hover_response(&mut server, &uri, 1, 10)?);
+        assert!(text.contains("Dumps docs."), "member docs, got: {text}");
+        assert!(!text.contains("pass"), "docs rendering, not source, got: {text}");
         Ok(())
     }
 }
